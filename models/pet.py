@@ -149,7 +149,7 @@ class BasePETCount(nn.Module):
         if 'test' in kwargs:
             outputs_offsets[...,0] /= (img_h / 256)
             outputs_offsets[...,1] /= (img_w / 256)
-
+        # points_queries = points_queries.to(outputs_offsets[-1].device)
         outputs_points = outputs_offsets[-1] + points_queries
         out = {'pred_logits': outputs_class[-1], 'pred_points': outputs_points, 'img_shape': img_shape, 'pred_offsets': outputs_offsets[-1]}
     
@@ -212,7 +212,39 @@ class PET(nn.Module):
         transformer = build_decoder(args)
         self.quadtree_sparse = BasePETCount(backbone, num_classes, quadtree_layer='sparse', args=args, transformer=transformer)
         self.quadtree_dense = BasePETCount(backbone, num_classes, quadtree_layer='dense', args=args, transformer=transformer)
+    # def forward_onnx(self, tensors, mask):
+    #     """
+    #     ONNX export 전용 forward.
+    #     입력은 NestedTensor 말고 순수 Tensor만 받는다.
+    #     tensors: (B, C, H, W)
+    #     mask   : (B, H, W)
+    #     """
+    #     # 1) NestedTensor로 다시 감싸기
+    #     samples = NestedTensor(tensors, mask)
 
+    #     # 2) 기존 forward 사용 (지금 쓰는 그대로)
+    #     outputs = self.forward(samples)  # 또는 self.predict(samples) 를 쓰고 있다면 그걸로 변경
+
+    #     # 3) ONNX로 내보낼 Tensor만 골라서 return
+    #     #    -> 여기 부분은 실제 모델의 forward 결과 구조에 맞게 수정 필요
+    #     # 예시) outputs 가 {'dense': {...}, 'sparse': {...}} 라고 가정하면:
+    #     # dense_out = outputs["dense"]
+    #     # pred_map  = dense_out["pred_map"]          # (B, 1, H', W')
+    #     # pred_cnt  = dense_out["pred_cnt"]          # (B, 1)
+    #     # return pred_map, pred_cnt
+
+    #     # 일단 템플릿으로는 이렇게:
+    #     if isinstance(outputs, dict):
+    #         # TODO: 실제 key 에 맞게 바꾸세요
+    #         # 예: pred_points, pred_offsets, pred_logits 등
+    #         main_out = outputs.get("dense", outputs)  # dense 브랜치가 있다면
+    #         # 예시로 두개만 export
+    #         pred_points = main_out["pred_points"]     # (B, Q, 2) 같은 형태라고 가정
+    #         pred_scores = main_out["pred_scores"]     # (B, Q, 1) 또는 (B, Q, num_classes)
+    #         return pred_points, pred_scores
+    #     else:
+    #         # outputs 가 이미 Tensor or tuple of Tensor 인 경우
+    #         return outputs
     def compute_loss(self, outputs, criterion, targets, epoch, samples):
         """
         Compute loss, including:

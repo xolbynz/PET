@@ -1,10 +1,31 @@
-# INSERT_YOUR_CODE
+# INSERT_YOUR_REWRITE_HERE
 import argparse
 import torch
 import os
 
 from models import build_model
 import util.misc as utils
+
+class PETONNXWrapper(torch.nn.Module):
+    """
+    Inference-only wrapper for PET, exposing the signature (tensors, mask) -> tensors suitable for ONNX export.
+    This is based on the logic in test_single_image.py for the inference and output processing steps.
+    """
+    def __init__(self, base_model):
+        super().__init__()
+        self.base_model = base_model
+
+    def forward(self, tensors, mask):
+        # tensors: (B, 3, H, W)
+        # mask: (B, H, W)
+        samples = utils.NestedTensor(tensors, mask)
+        outputs = self.base_model(samples, test=True)
+        # Extract outputs as done in test_single_image.py
+        logits = outputs['pred_logits']
+        pred_points = outputs['pred_points']
+        # Optionally, export the split_map_raw as well for downstream use
+        split_map_raw = outputs.get('split_map_raw', None)
+        return logits, pred_points, split_map_raw
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Set Point Query Transformer Export ONNX', add_help=False)
@@ -30,13 +51,11 @@ def get_args_parser():
     parser.add_argument('--data_path', default="./data/ShanghaiTech/PartA", type=str)
 
     # misc parameters
-    parser.add_argument('--device', default='cpu', help='device to use for export')
+    parser.add_argument('--device', default='cuda:0', help='device to use for export')
     parser.add_argument('--resume', default='outputs/SHA/ckpt_251024/checkpoint.pth', help='resume from checkpoint')
     parser.add_argument('--onnx_out', default='pet_exported.onnx', type=str)
     parser.add_argument('--opset', default=11, type=int)
-    parser.add_argument('--img-size', nargs='+', type=int, default=[1280, 1280], help='image size')  # height, width
-
-
+    parser.add_argument('--img-size', nargs='+', type=int, default=[1280, 1280], help='image size')
     return parser
 
 def main(args):
@@ -48,39 +67,48 @@ def main(args):
 
     # Load weights
     if args.resume and os.path.exists(args.resume):
-        checkpoint = torch.load(args.resume, map_location='cpu')
+        checkpoint = torch.load(args.resume, map_location=device)
         model.load_state_dict(checkpoint['model'])
     else:
         print(f"Checkpoint not found at {args.resume}")
         return
 
-    # Dummy input for export (Batch x 3 x H x W)
-    dummy_input = torch.randn(1, 3, args.img_size[0], args.img_size[1], device=device)  # Default 512x512
+    # Compose the wrapper for ONNX export
+    onnx_model = PETONNXWrapper(model).to(device)
+    onnx_model.eval()
 
-    # NestedTensor preparation (test_single_image uses utils.nested_tensor_from_tensor_list)
-    samples = utils.nested_tensor_from_tensor_list([dummy_input[0]])
-    # Move to batch
-    samples = samples.to(device)
+    # Dummy input (Batch, 3, H, W), mask (Batch, H, W)
+    dummy_tensors = torch.randn(1, 3, args.img_size[0], args.img_size[1], device=device)
+    dummy_mask = torch.zeros(1, args.img_size[0], args.img_size[1], dtype=torch.bool, device=device)  # unmasked
 
-    # Do a forward pass to check
+    # Forward sanity check
     with torch.no_grad():
-        outputs = model(samples)
+        out = onnx_model(dummy_tensors, dummy_mask)
+        print("Dummy forward output shapes:",
+              [x.shape if x is not None else None for x in out])
 
-    # Actual export
+    # ONNX export
     input_names = ["tensors", "mask"]
-    output_names = list(outputs.keys())
-    torch.onnx.export(model,
-                      (samples,),
-                      args.onnx_out,
-                      opset_version=args.opset,
-                      input_names=input_names,
-                      output_names=output_names,
-                      dynamic_axes={
-                          "tensors": {0: "batch", 2: "height", 3: "width"},
-                          "mask": {0: "batch", 1: "height", 2: "width"},
-                      },
-                      do_constant_folding=True,
-                      verbose=True)
+    output_names = ["pred_logits", "pred_points", "split_map_raw"]
+    dynamic_axes = {
+        'tensors': {0: 'batch', 2: 'height', 3: 'width'},
+        'mask': {0: 'batch', 1: 'height', 2: 'width'},
+        'pred_logits': {0: 'batch', 1: 'num_queries'},   # shape [B, Q, C]
+        'pred_points': {0: 'batch', 1: 'num_queries'},   # shape [B, Q, 2]
+        'split_map_raw': {0: 'batch', 2: 'height_out', 3: 'width_out'},  # [B, 1, H', W']
+    }
+
+    torch.onnx.export(
+        onnx_model,
+        (dummy_tensors, dummy_mask),
+        args.onnx_out,
+        opset_version=args.opset,
+        input_names=input_names,
+        output_names=output_names,
+        dynamic_axes=dynamic_axes,
+        do_constant_folding=True,
+        verbose=True,
+    )
 
     print(f"Model has been exported to {args.onnx_out}")
 
